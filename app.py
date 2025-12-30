@@ -1,10 +1,9 @@
 """
 app.py (v2)
 
-- Shows logic version stamp in UI
-- Screen 1: three tiles (Prediction / Actual / Comparison)
-- Past-date backtesting: run strategy for any selected date and compare with reality
-- Screen 2: historical archive from trade_history.csv
+- Prints "v2" in UI and logic.py version
+- Screen 1: Past-date backtesting with 3 tiles (Prediction/Actual/Comparison)
+- Screen 2: Historical archive from trade_history.csv
 """
 
 import streamlit as st
@@ -14,17 +13,16 @@ from datetime import datetime
 import pytz
 
 import logic
-from logic import generate_signals_for_date, evaluate_trade_actuals
+from logic import generate_signals_for_date, evaluate_trade_actuals, get_market_trend
 
 TZ_IST = pytz.timezone("Asia/Kolkata")
 CSV_FILE = "trade_history.csv"
 
 st.set_page_config(layout="wide", page_title="Nifty Auto Bot v2")
 
-# --- Header with v2 stamps ---
 st.title("Nifty Intraday Auto Bot")
 st.caption("Cloud automated via GitHub Actions + Past-Date Backtesting (Prediction vs Reality)")
-st.write(f"UI version: v2 | logic.py version: {logic.LOGIC_VERSION}")  # <-- prints v2 in UI
+st.write(f"UI version: v2 | logic.py version: {logic.LOGIC_VERSION}")
 
 
 def color_outcome(outcome: str) -> str:
@@ -50,7 +48,6 @@ history_df = load_history()
 
 tab1, tab2 = st.tabs(["Screen 1: Dashboard", "Screen 2: Historical Archive"])
 
-# ---------------- Screen 1 ----------------
 with tab1:
     st.subheader("Past-Date Backtesting & Reality Comparison (v2)")
 
@@ -76,17 +73,19 @@ with tab1:
 
     if run_btn:
         with st.spinner("Running historical scan and fetching actual outcomes..."):
-            signals = generate_signals_for_date(backtest_date, scan_time_ist=scan_time_ist)
+            # show trend used (helps verify NIFTY fetch)
+            trend_used = get_market_trend(as_of_date=backtest_date)
+            st.write("Trend used:", trend_used)
 
-            st.write("Signals generated:", len(signals))  # helpful debug
+            signals = generate_signals_for_date(backtest_date, scan_time_ist=scan_time_ist)
+            st.write("Signals generated:", len(signals))
 
             if not signals:
                 st.info(
-                    "No signals generated for this date/time using the current logic. "
-                    "This can also happen if intraday data is not available via yfinance for that date."
+                    "No signals generated for this date/time. "
+                    "Either conditions were not met or intraday data isn't available via yfinance for that date."
                 )
             else:
-                # Compute actuals for each signal (1m)
                 rows = []
                 for s in signals:
                     ticker_ns = f"{s['ticker']}.NS"
@@ -95,7 +94,6 @@ with tab1:
                     sl = float(s["sl"])
                     target = float(s["target"])
 
-                    # Parse entry_time_ist string like "YYYY-MM-DD HH:MM:SS+0530"
                     entry_time_ist = None
                     try:
                         entry_time_ist = datetime.strptime(s["entry_time_ist"], "%Y-%m-%d %H:%M:%S%z").astimezone(TZ_IST)
@@ -127,7 +125,6 @@ with tab1:
 
                 t1, t2, t3 = st.columns(3)
 
-                # Tile 1: Prediction
                 with t1:
                     st.markdown("### Prediction")
                     st.metric("Ticker", row["ticker"])
@@ -138,7 +135,6 @@ with tab1:
                     st.caption(f"Trend: {row.get('trend', 'NA')} | Reason: {row.get('reason', 'NA')}")
                     st.caption(f"Entry time (IST): {row.get('entry_time_ist', 'NA')}")
 
-                # Tile 2: Actual
                 with t2:
                     st.markdown("### Actual Market Outcome")
                     ph = row.get("post_high", None)
@@ -149,7 +145,6 @@ with tab1:
                     st.metric("Post Close", f"{pc:.2f}" if isinstance(pc, (int, float)) and pc is not None else "NA")
                     st.caption(row.get("actual_result", ""))
 
-                # Tile 3: Comparison
                 with t3:
                     outcome = row.get("outcome", "PENDING")
                     bg = color_outcome(outcome)
@@ -186,7 +181,6 @@ with tab1:
         st.dataframe(today_df, use_container_width=True)
 
 
-# ---------------- Screen 2 ----------------
 with tab2:
     st.subheader("Historical Archive (from trade_history.csv)")
 
