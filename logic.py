@@ -4,6 +4,7 @@ import pandas_ta as ta
 from datetime import datetime, date, timedelta
 import pytz
 
+# ---------------- CONFIG ----------------
 TICKERS = [
     "RELIANCE.NS", "HDFCBANK.NS", "ICICIBANK.NS", "INFY.NS",
     "TCS.NS", "ITC.NS", "LT.NS", "AXISBANK.NS", "SBIN.NS", "TITAN.NS"
@@ -13,11 +14,11 @@ TZ_IST = pytz.timezone("Asia/Kolkata")
 DEFAULT_SCAN_TIME_IST = "10:00"
 
 
+# ---------------- UTIL ----------------
 def _to_ist_index(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
     if getattr(df.index, "tz", None) is None:
-        # yfinance intraday is typically UTC; be defensive
         df.index = df.index.tz_localize("UTC").tz_convert(TZ_IST)
     else:
         df.index = df.index.tz_convert(TZ_IST)
@@ -32,25 +33,25 @@ def _parse_scan_dt_ist(trade_date: date, scan_time_ist: str) -> datetime:
 # ---------------- MARKET TREND ----------------
 def get_market_trend(as_of_date: date | None = None) -> str:
     """
-    Check NIFTY trend using 200 EMA.
-    Safe against insufficient history / NaNs.
+    NIFTY trend using 200 EMA.
+    Safe against insufficient history / NaNs and date slicing.
     """
-    nifty = yf.download("^NSEI", period="24mo", interval="1d", progress=False)
+    nifty = yf.download("^NSEI", period="36mo", interval="1d", progress=False)
     if nifty is None or nifty.empty:
         return "NEUTRAL"
 
-    nifty = nifty.dropna()
+    nifty = nifty.dropna(subset=["Close"])
 
     # Compute EMA_200
     nifty["EMA_200"] = ta.ema(nifty["Close"], length=200)
 
-    # If a date is provided, keep data up to that date
+    # Apply as-of date filter if requested
     if as_of_date is not None:
         nifty = nifty[nifty.index.date <= as_of_date]
         if nifty.empty:
             return "NEUTRAL"
 
-    # Drop rows where EMA is NaN (not enough history)
+    # Drop rows where EMA is NaN (not enough candles)
     nifty = nifty.dropna(subset=["EMA_200"])
     if nifty.empty:
         return "NEUTRAL"
@@ -63,12 +64,14 @@ def get_market_trend(as_of_date: date | None = None) -> str:
 
 # ---------------- SIGNAL GENERATION ----------------
 def generate_signals_for_date(trade_date: date, scan_time_ist: str = DEFAULT_SCAN_TIME_IST):
+    """
+    Historical scan: uses 15m data (period-based fetch) then filters by date.
+    """
     trend = get_market_trend(as_of_date=trade_date)
-    signals = []
-
     scan_dt_ist = _parse_scan_dt_ist(trade_date, scan_time_ist)
 
-    # IMPORTANT: fetch per-ticker with a longer period (more reliable than start/end for intraday)
+    signals = []
+
     for ticker in TICKERS:
         df = yf.download(
             ticker,
@@ -87,12 +90,12 @@ def generate_signals_for_date(trade_date: date, scan_time_ist: str = DEFAULT_SCA
         if df_today.empty:
             continue
 
-        # ORB = first 15m candle
+        # ORB candle = first 15m candle of that day
         first = df_today.iloc[0]
         orb_high = float(first["High"])
         orb_low = float(first["Low"])
 
-        # Entry close = last 15m close up to scan time
+        # "Entry close" = last close available up to scan time
         df_upto_scan = df_today[df_today.index <= scan_dt_ist]
         if df_upto_scan.empty:
             close = float(df_today.iloc[0]["Close"])
@@ -152,7 +155,9 @@ def evaluate_trade_actuals(
     target: float,
     entry_time_ist: datetime | None = None
 ):
-    # Fetch per-ticker 1m data with period to increase reliability
+    """
+    Uses 1m data (period-based fetch) then filters by date, evaluates after entry time.
+    """
     df = yf.download(
         ticker_ns,
         period="7d",
@@ -212,6 +217,9 @@ def evaluate_trade_actuals(
 
 
 def check_results(history_df: pd.DataFrame):
+    """
+    Live daily evaluation for today's OPEN trades in CSV.
+    """
     if history_df is None or history_df.empty:
         return history_df
 
