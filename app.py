@@ -62,6 +62,7 @@ with tab1:
     if run_btn:
         with st.spinner("Running historical scan and fetching actual outcomes..."):
             signals = generate_signals_for_date(backtest_date, scan_time_ist=scan_time_ist)
+            st.write(f"Signals generated: {len(signals)}")
 
             if not signals:
                 st.info("No signals generated for this date using current logic.")
