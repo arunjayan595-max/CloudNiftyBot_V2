@@ -1,11 +1,10 @@
 """
-logic.py (v4)
+logic.py (v5)
 
 Improvements:
-- Strategy: ORB + RSI Filter + Volume Confirmation (reduces false breakouts).
-- Tickers: Expanded to Top 20 Nifty weights.
-- Time Limit: Checks if breakout happens near scan time.
-- Robustness: Keeps the v3 crash-prevention fixes.
+- End of Day Logic: If Target/SL isn't hit, check if we closed in profit (Green) or loss (Red).
+- Keeps v4 Strategy: ORB + RSI + Volume.
+- Keeps 20 Nifty Stocks.
 """
 
 from __future__ import annotations
@@ -13,14 +12,13 @@ from __future__ import annotations
 import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 import pytz
 
 # ---------------- VERSION STAMP ----------------
-LOGIC_VERSION = "v4 (Smart Filter)"
+LOGIC_VERSION = "v5 (End-of-Day Logic)"
 
 # ---------------- CONFIG ----------------
-# Expanded list: Top ~20 Nifty 50 Heavyweights
 TICKERS = [
     "RELIANCE.NS", "HDFCBANK.NS", "ICICIBANK.NS", "INFY.NS",
     "TCS.NS", "ITC.NS", "LT.NS", "AXISBANK.NS", "SBIN.NS",
@@ -34,11 +32,11 @@ DEFAULT_SCAN_TIME_IST = "10:00"
 
 # Strategy Settings
 RSI_PERIOD = 14
-RSI_BUY_MIN = 55   # Momentum must be building
-RSI_BUY_MAX = 70   # Don't buy if already overbought
-RSI_SELL_MAX = 45  # Momentum must be dropping
-RSI_SELL_MIN = 30  # Don't sell if already oversold
-VOL_MA = 20        # Volume Moving Average length
+RSI_BUY_MIN = 55   
+RSI_BUY_MAX = 70   
+RSI_SELL_MAX = 45  
+RSI_SELL_MIN = 30  
+VOL_MA = 20        
 
 # ---------------- UTIL ----------------
 def _to_ist_index(df: pd.DataFrame) -> pd.DataFrame:
@@ -52,20 +50,15 @@ def _to_ist_index(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def _parse_scan_dt_ist(trade_date: date, scan_time_ist: str) -> datetime:
-    """Build IST datetime from date + 'HH:MM'."""
     hh, mm = scan_time_ist.split(":")
     return TZ_IST.localize(datetime(trade_date.year, trade_date.month, trade_date.day, int(hh), int(mm), 0))
 
 def _get_1d_series(df: pd.DataFrame, col_name: str) -> pd.Series | None:
-    """Robustly extract a 1D Series for a specific column name."""
-    if df is None or df.empty:
-        return None
-    
+    if df is None or df.empty: return None
     def to_series(data):
         if isinstance(data, pd.Series): return data
         if isinstance(data, pd.DataFrame): return data.iloc[:, 0] if not data.empty else None
         return None
-
     col_lower = col_name.lower()
     if col_name in df.columns: return to_series(df[col_name])
     if isinstance(df.columns, pd.MultiIndex):
@@ -79,79 +72,50 @@ def _get_1d_series(df: pd.DataFrame, col_name: str) -> pd.Series | None:
 
 # ---------------- MARKET TREND ----------------
 def get_market_trend(as_of_date: date | None = None) -> str:
-    """NIFTY trend using 200 EMA of daily closes."""
     nifty = yf.download("^NSEI", period="36mo", interval="1d", progress=False)
     close = _get_1d_series(nifty, "Close")
-
     if close is None or close.empty: return "NEUTRAL"
-    
-    # Clean and Calc
     tmp = pd.DataFrame({"Close": pd.to_numeric(close, errors="coerce")}).dropna()
     if as_of_date:
         tmp = tmp[tmp.index.date <= as_of_date]
         if tmp.empty: return "NEUTRAL"
-
     tmp["EMA_200"] = ta.ema(tmp["Close"], length=200)
     tmp = tmp.dropna(subset=["EMA_200"])
-    
     if tmp.empty: return "NEUTRAL"
     last_close = float(tmp["Close"].iloc[-1])
     last_ema = float(tmp["EMA_200"].iloc[-1])
-
     return "BULLISH" if last_close > last_ema else "BEARISH"
 
 # ---------------- SIGNAL GENERATION ----------------
 def generate_signals_for_date(trade_date: date, scan_time_ist: str = DEFAULT_SCAN_TIME_IST) -> list[dict]:
-    """
-    Generate Signals using ORB + RSI + Volume.
-    """
     trend = get_market_trend(as_of_date=trade_date)
     scan_dt_ist = _parse_scan_dt_ist(trade_date, scan_time_ist)
     
-    # Check if date is too old (yfinance limit ~60 days)
-    days_diff = (datetime.now().date() - trade_date).days
-    if days_diff > 59:
-        print(f"Warning: {trade_date} is older than 60 days. Intraday data unlikely available.")
-
     signals: list[dict] = []
 
     for ticker in TICKERS:
         try:
-            # Download extra days to ensure RSI calculation is accurate
             df = yf.download(ticker, period="60d", interval="15m", progress=False, auto_adjust=False)
             if df is None or df.empty: continue
-
             df = _to_ist_index(df)
             
-            # Robust Extraction
             c_s = _get_1d_series(df, "Close")
             h_s = _get_1d_series(df, "High")
             l_s = _get_1d_series(df, "Low")
-            v_s = _get_1d_series(df, "Volume") # Added Volume
+            v_s = _get_1d_series(df, "Volume") 
 
             if any(x is None for x in [c_s, h_s, l_s, v_s]): continue
 
-            # Build Analysis DataFrame
-            data = pd.DataFrame({
-                "Close": c_s, "High": h_s, "Low": l_s, "Volume": v_s
-            }).dropna()
-
-            # --- TA CALCULATIONS (RSI & Vol SMA) ---
+            data = pd.DataFrame({"Close": c_s, "High": h_s, "Low": l_s, "Volume": v_s}).dropna()
             data["RSI"] = ta.rsi(data["Close"], length=RSI_PERIOD)
             data["Vol_SMA"] = ta.sma(data["Volume"], length=VOL_MA)
 
-            # Filter for specific trade date
             df_day = data[data.index.date == trade_date].copy()
             if df_day.empty: continue
 
-            # ORB Reference (First Candle)
             first = df_day.iloc[0]
-            orb_high = float(first["High"])
-            orb_low = float(first["Low"])
-            orb_vol = float(first["Volume"])
+            orb_high, orb_low = float(first["High"]), float(first["Low"])
             
-            # Scan Logic: Look at the candle happening AT or just BEFORE scan time
-            # We want the 'entry setup' to be ready by scan time.
             df_upto_scan = df_day[df_day.index <= scan_dt_ist]
             if df_upto_scan.empty: continue
             
@@ -160,45 +124,28 @@ def generate_signals_for_date(trade_date: date, scan_time_ist: str = DEFAULT_SCA
             curr_rsi = float(current_bar["RSI"]) if pd.notna(current_bar["RSI"]) else 50.0
             curr_vol = float(current_bar["Volume"])
             vol_avg = float(current_bar["Vol_SMA"]) if pd.notna(current_bar["Vol_SMA"]) else 0.0
-
             entry_ts = df_upto_scan.index[-1]
 
             signal = None
             reason = []
 
-            # --- SMART LOGIC ---
-            
-            # BUY LOGIC
             if trend == "BULLISH" and curr_close > orb_high:
-                # Filter 1: RSI must be healthy (55-70)
                 if RSI_BUY_MIN <= curr_rsi <= RSI_BUY_MAX:
-                    # Filter 2: Volume confirmation (Current vol > 80% of Avg)
                     if vol_avg > 0 and curr_vol > (vol_avg * 0.8):
                         signal = "BUY"
                         sl = orb_low
                         target = curr_close + (curr_close - orb_low) * 2
                         reason.append(f"RSI({int(curr_rsi)}) OK")
                         reason.append("Vol OK")
-                    else:
-                        reason.append("Low Volume")
-                else:
-                    reason.append(f"RSI({int(curr_rsi)}) Invalid")
 
-            # SELL LOGIC
             elif trend == "BEARISH" and curr_close < orb_low:
-                # Filter 1: RSI healthy (30-45)
                 if RSI_SELL_MIN <= curr_rsi <= RSI_SELL_MAX:
-                    # Filter 2: Volume
                     if vol_avg > 0 and curr_vol > (vol_avg * 0.8):
                         signal = "SELL"
                         sl = orb_high
                         target = curr_close - (orb_high - curr_close) * 2
                         reason.append(f"RSI({int(curr_rsi)}) OK")
                         reason.append("Vol OK")
-                    else:
-                        reason.append("Low Volume")
-                else:
-                    reason.append(f"RSI({int(curr_rsi)}) Invalid")
 
             if signal:
                 signals.append({
@@ -218,17 +165,21 @@ def generate_signals_for_date(trade_date: date, scan_time_ist: str = DEFAULT_SCA
                 })
         except Exception:
             continue
-
     return signals
 
 def generate_signals() -> list[dict]:
-    """Live: generate signals for today."""
     today = datetime.now(TZ_IST).date()
     return generate_signals_for_date(today, DEFAULT_SCAN_TIME_IST)
 
-# ---------------- ACTUAL OUTCOME CHECKER ----------------
+# ---------------- UPDATED OUTCOME CHECKER ----------------
 def evaluate_trade_actuals(ticker_ns, trade_date, side, entry, sl, target, entry_time_ist=None):
-    """Evaluate WIN/LOSS using 1m candles (Only works for last 7 days)."""
+    """
+    Improved Logic:
+    1. Checks if Target or SL was hit.
+    2. If neither was hit, checks the Closing Price.
+       - If Close > Entry (Buy) = WIN (Profit)
+       - If Close < Entry (Buy) = LOSS
+    """
     try:
         df = yf.download(ticker_ns, period="7d", interval="1m", progress=False, auto_adjust=False)
         if df is None or df.empty: return "PENDING", "No 1m data", None, None, None
@@ -237,9 +188,7 @@ def evaluate_trade_actuals(ticker_ns, trade_date, side, entry, sl, target, entry
         if df_day.empty: return "PENDING", "Date not in 7d range", None, None, None
 
         c_s, h_s, l_s = _get_1d_series(df_day, "Close"), _get_1d_series(df_day, "High"), _get_1d_series(df_day, "Low")
-        if c_s is None: return "PENDING", "Data Error", None, None, None
-        
-        clean = pd.DataFrame({"Close": c_s, "High": h_s, "Low": l_s})
+        clean = pd.DataFrame({"Close": c_s, "High": h_s, "Low": l_s}).dropna()
         
         if entry_time_ist:
             if entry_time_ist.tzinfo is None: entry_time_ist = TZ_IST.localize(entry_time_ist)
@@ -247,26 +196,39 @@ def evaluate_trade_actuals(ticker_ns, trade_date, side, entry, sl, target, entry
 
         if clean.empty: return "PENDING", "No data after entry", None, None, None
         
-        # Calculate Outcome
         ph, pl, lc = float(clean["High"].max()), float(clean["Low"].min()), float(clean["Close"].iloc[-1])
 
+        # --- EVALUATION LOGIC ---
         if side == "BUY":
-            if ph >= target and pl <= sl: return "LOSS", "Choppy (Both Hit)", ph, pl, lc
-            if ph >= target: return "WIN", f"Target {target} hit", ph, pl, lc
-            if pl <= sl: return "LOSS", f"SL {sl} hit", ph, pl, lc
-            return "NOT_TRIGGERED", f"Running (Close: {lc})", ph, pl, lc
+            # 1. Did we hit Target?
+            if ph >= target: 
+                return "WIN", f"Target Hit ({target})", ph, pl, lc
+            # 2. Did we hit SL?
+            if pl <= sl: 
+                return "LOSS", f"SL Hit ({sl})", ph, pl, lc
+            
+            # 3. Neither hit? Check End-of-Day status
+            if lc > entry:
+                return "WIN", f"Day End Profit (+{round(lc - entry, 2)})", ph, pl, lc
+            else:
+                return "LOSS", f"Day End Loss ({round(lc - entry, 2)})", ph, pl, lc
+
         elif side == "SELL":
-            if pl <= target and ph >= sl: return "LOSS", "Choppy (Both Hit)", ph, pl, lc
-            if pl <= target: return "WIN", f"Target {target} hit", ph, pl, lc
-            if ph >= sl: return "LOSS", f"SL {sl} hit", ph, pl, lc
-            return "NOT_TRIGGERED", f"Running (Close: {lc})", ph, pl, lc
+            if pl <= target: 
+                return "WIN", f"Target Hit ({target})", ph, pl, lc
+            if ph >= sl: 
+                return "LOSS", f"SL Hit ({sl})", ph, pl, lc
+            
+            if lc < entry:
+                return "WIN", f"Day End Profit (+{round(entry - lc, 2)})", ph, pl, lc
+            else:
+                return "LOSS", f"Day End Loss ({round(entry - lc, 2)})", ph, pl, lc
             
         return "PENDING", "Error", ph, pl, lc
     except Exception:
         return "PENDING", "Eval Crash", None, None, None
 
 def check_results(history_df: pd.DataFrame) -> pd.DataFrame:
-    # (Kept identical to v3, just referencing eval function above)
     if history_df is None or history_df.empty: return history_df
     today = datetime.now(TZ_IST).date()
     open_trades = history_df[(history_df["status"] == "OPEN") & (history_df["date"] == str(today))]
