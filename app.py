@@ -1,27 +1,41 @@
+"""
+app.py (v2)
+
+- Shows logic version stamp in UI
+- Screen 1: three tiles (Prediction / Actual / Comparison)
+- Past-date backtesting: run strategy for any selected date and compare with reality
+- Screen 2: historical archive from trade_history.csv
+"""
+
 import streamlit as st
 import pandas as pd
 import os
-from datetime import datetime, date
+from datetime import datetime
 import pytz
 
+import logic
 from logic import generate_signals_for_date, evaluate_trade_actuals
 
 TZ_IST = pytz.timezone("Asia/Kolkata")
 CSV_FILE = "trade_history.csv"
 
-st.set_page_config(layout="wide", page_title="Nifty Auto Bot")
+st.set_page_config(layout="wide", page_title="Nifty Auto Bot v2")
 
+# --- Header with v2 stamps ---
 st.title("Nifty Intraday Auto Bot")
-st.caption("Automated via GitHub Actions + Past-Date Backtesting (Prediction vs Reality)")
+st.caption("Cloud automated via GitHub Actions + Past-Date Backtesting (Prediction vs Reality)")
+st.write(f"UI version: v2 | logic.py version: {logic.LOGIC_VERSION}")  # <-- prints v2 in UI
+
 
 def color_outcome(outcome: str) -> str:
     if outcome == "WIN":
-        return "#1b5e20"   # dark green
+        return "#1b5e20"
     if outcome == "LOSS":
-        return "#b71c1c"   # dark red
+        return "#b71c1c"
     if outcome == "NOT_TRIGGERED":
-        return "#616161"   # grey
-    return "#37474f"       # default slate
+        return "#616161"
+    return "#37474f"
+
 
 def load_history() -> pd.DataFrame:
     if not os.path.exists(CSV_FILE):
@@ -31,13 +45,14 @@ def load_history() -> pd.DataFrame:
         df = df.sort_values(["date", "ticker"], ascending=[False, True])
     return df
 
+
 history_df = load_history()
 
 tab1, tab2 = st.tabs(["Screen 1: Dashboard", "Screen 2: Historical Archive"])
 
 # ---------------- Screen 1 ----------------
 with tab1:
-    st.subheader("Past-Date Backtesting & Reality Comparison")
+    st.subheader("Past-Date Backtesting & Reality Comparison (v2)")
 
     cA, cB, cC = st.columns([1.2, 1, 1])
 
@@ -62,10 +77,14 @@ with tab1:
     if run_btn:
         with st.spinner("Running historical scan and fetching actual outcomes..."):
             signals = generate_signals_for_date(backtest_date, scan_time_ist=scan_time_ist)
-            st.write(f"Signals generated: {len(signals)}")
+
+            st.write("Signals generated:", len(signals))  # helpful debug
 
             if not signals:
-                st.info("No signals generated for this date using current logic.")
+                st.info(
+                    "No signals generated for this date/time using the current logic. "
+                    "This can also happen if intraday data is not available via yfinance for that date."
+                )
             else:
                 # Compute actuals for each signal (1m)
                 rows = []
@@ -76,11 +95,10 @@ with tab1:
                     sl = float(s["sl"])
                     target = float(s["target"])
 
-                    # entry_time_ist stored string with offset; parse
+                    # Parse entry_time_ist string like "YYYY-MM-DD HH:MM:SS+0530"
                     entry_time_ist = None
                     try:
-                        entry_time_ist = datetime.strptime(s["entry_time_ist"], "%Y-%m-%d %H:%M:%S%z")
-                        entry_time_ist = entry_time_ist.astimezone(TZ_IST)
+                        entry_time_ist = datetime.strptime(s["entry_time_ist"], "%Y-%m-%d %H:%M:%S%z").astimezone(TZ_IST)
                     except Exception:
                         entry_time_ist = None
 
@@ -104,12 +122,9 @@ with tab1:
 
                 bt_df = pd.DataFrame(rows)
 
-                # Pick one trade to show tiles; user can choose
-                tickers = bt_df["ticker"].tolist()
-                chosen = st.selectbox("Select a trade to view tiles", options=tickers)
+                chosen = st.selectbox("Select a trade to view tiles", options=bt_df["ticker"].tolist())
                 row = bt_df[bt_df["ticker"] == chosen].iloc[0].to_dict()
 
-                # Tiles
                 t1, t2, t3 = st.columns(3)
 
                 # Tile 1: Prediction
@@ -123,7 +138,7 @@ with tab1:
                     st.caption(f"Trend: {row.get('trend', 'NA')} | Reason: {row.get('reason', 'NA')}")
                     st.caption(f"Entry time (IST): {row.get('entry_time_ist', 'NA')}")
 
-                # Tile 2: Actual Market Outcome
+                # Tile 2: Actual
                 with t2:
                     st.markdown("### Actual Market Outcome")
                     ph = row.get("post_high", None)
@@ -134,7 +149,7 @@ with tab1:
                     st.metric("Post Close", f"{pc:.2f}" if isinstance(pc, (int, float)) and pc is not None else "NA")
                     st.caption(row.get("actual_result", ""))
 
-                # Tile 3: Comparison & Analysis
+                # Tile 3: Comparison
                 with t3:
                     outcome = row.get("outcome", "PENDING")
                     bg = color_outcome(outcome)
@@ -159,16 +174,13 @@ with tab1:
                     ]],
                     use_container_width=True
                 )
-    else:
-        st.info("Select a date and click **Run Backtest** to see prediction vs reality tiles.")
 
     st.divider()
-    st.subheader("Live/Journal View (from trade_history.csv)")
+    st.subheader("Live / Journal View (trade_history.csv)")
 
     if history_df.empty:
         st.warning("No trade_history.csv found yet. Run GitHub Actions once to generate data.")
     else:
-        # show today's trades quickly
         today_str = str(datetime.now(TZ_IST).date())
         today_df = history_df[history_df["date"] == today_str].copy()
         st.dataframe(today_df, use_container_width=True)
@@ -176,7 +188,7 @@ with tab1:
 
 # ---------------- Screen 2 ----------------
 with tab2:
-    st.subheader("Historical Archive (Drill-Down by Date)")
+    st.subheader("Historical Archive (from trade_history.csv)")
 
     if history_df.empty:
         st.warning("No history available yet.")
@@ -186,17 +198,14 @@ with tab2:
 
         day_df = history_df[history_df["date"] == selected_date_str].copy()
 
-        # Ensure numeric formatting
         for col in ["entry", "sl", "target", "post_high", "post_low", "post_close"]:
             if col in day_df.columns:
                 day_df[col] = pd.to_numeric(day_df[col], errors="coerce")
 
-        # Outcome color styling
         def style_outcome_row(r):
             bg = color_outcome(str(r.get("outcome", "")))
             return [f"background-color: {bg}; color: white" if c == "outcome" else "" for c in r.index]
 
-        st.markdown("### Trades for selected date")
         st.dataframe(
             day_df[[
                 "date", "ticker", "prediction", "entry", "sl", "target",
