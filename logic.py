@@ -1,8 +1,23 @@
+"""
+logic.py (v2)
+
+Adds:
+- Past-date backtesting support (generate_signals_for_date)
+- Robust trend calc (no EMA NaN crash)
+- Robust yfinance intraday fetching (period-based for reliability)
+- Actual outcome evaluation from 1m data after entry time
+"""
+
+from __future__ import annotations
+
 import yfinance as yf
 import pandas as pd
 import pandas_ta as ta
 from datetime import datetime, date, timedelta
 import pytz
+
+# ---------------- VERSION STAMP (shown in UI) ----------------
+LOGIC_VERSION = "v2"
 
 # ---------------- CONFIG ----------------
 TICKERS = [
@@ -16,9 +31,11 @@ DEFAULT_SCAN_TIME_IST = "10:00"
 
 # ---------------- UTIL ----------------
 def _to_ist_index(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure dataframe index is tz-aware IST."""
     if df is None or df.empty:
         return df
     if getattr(df.index, "tz", None) is None:
+        # yfinance intraday is usually UTC; localize then convert
         df.index = df.index.tz_localize("UTC").tz_convert(TZ_IST)
     else:
         df.index = df.index.tz_convert(TZ_IST)
@@ -26,6 +43,7 @@ def _to_ist_index(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _parse_scan_dt_ist(trade_date: date, scan_time_ist: str) -> datetime:
+    """Build IST datetime from date + HH:MM string."""
     hh, mm = scan_time_ist.split(":")
     return TZ_IST.localize(datetime(trade_date.year, trade_date.month, trade_date.day, int(hh), int(mm), 0))
 
@@ -33,25 +51,23 @@ def _parse_scan_dt_ist(trade_date: date, scan_time_ist: str) -> datetime:
 # ---------------- MARKET TREND ----------------
 def get_market_trend(as_of_date: date | None = None) -> str:
     """
-    NIFTY trend using 200 EMA.
-    Safe against insufficient history / NaNs and date slicing.
+    Check NIFTY trend using 200 EMA.
+    FIXED: cannot crash due to EMA NaN. If insufficient history, returns NEUTRAL.
     """
     nifty = yf.download("^NSEI", period="36mo", interval="1d", progress=False)
     if nifty is None or nifty.empty:
         return "NEUTRAL"
 
     nifty = nifty.dropna(subset=["Close"])
-
-    # Compute EMA_200
     nifty["EMA_200"] = ta.ema(nifty["Close"], length=200)
 
-    # Apply as-of date filter if requested
+    # Use data only up to the chosen historical date (backtesting)
     if as_of_date is not None:
         nifty = nifty[nifty.index.date <= as_of_date]
         if nifty.empty:
             return "NEUTRAL"
 
-    # Drop rows where EMA is NaN (not enough candles)
+    # IMPORTANT: remove NaN EMA rows (happens until 200 bars exist)
     nifty = nifty.dropna(subset=["EMA_200"])
     if nifty.empty:
         return "NEUTRAL"
@@ -63,19 +79,23 @@ def get_market_trend(as_of_date: date | None = None) -> str:
 
 
 # ---------------- SIGNAL GENERATION ----------------
-def generate_signals_for_date(trade_date: date, scan_time_ist: str = DEFAULT_SCAN_TIME_IST):
+def generate_signals_for_date(trade_date: date, scan_time_ist: str = DEFAULT_SCAN_TIME_IST) -> list[dict]:
     """
-    Historical scan: uses 15m data (period-based fetch) then filters by date.
+    Generate ORB signals for a specific historical date (IST).
+
+    Data source note:
+    - Uses period-based intraday fetch (more reliable than start/end for many users).
+    - This means very old dates may not be available in yfinance intraday.
     """
     trend = get_market_trend(as_of_date=trade_date)
     scan_dt_ist = _parse_scan_dt_ist(trade_date, scan_time_ist)
 
-    signals = []
+    signals: list[dict] = []
 
     for ticker in TICKERS:
         df = yf.download(
             ticker,
-            period="60d",
+            period="60d",      # reliable window; older dates may not be present
             interval="15m",
             progress=False,
             auto_adjust=False
@@ -85,17 +105,16 @@ def generate_signals_for_date(trade_date: date, scan_time_ist: str = DEFAULT_SCA
             continue
 
         df = _to_ist_index(df)
-
         df_today = df[df.index.date == trade_date].copy()
         if df_today.empty:
             continue
 
-        # ORB candle = first 15m candle of that day
+        # ORB candle = first 15m candle of the day
         first = df_today.iloc[0]
         orb_high = float(first["High"])
         orb_low = float(first["Low"])
 
-        # "Entry close" = last close available up to scan time
+        # Entry close = last available 15m close up to scan time
         df_upto_scan = df_today[df_today.index <= scan_dt_ist]
         if df_upto_scan.empty:
             close = float(df_today.iloc[0]["Close"])
@@ -109,6 +128,7 @@ def generate_signals_for_date(trade_date: date, scan_time_ist: str = DEFAULT_SCA
         target = None
         reason = None
 
+        # Same logic as your original code, with trend filter
         if trend == "BULLISH" and close > orb_high:
             signal = "BUY"
             sl = orb_low
@@ -131,6 +151,8 @@ def generate_signals_for_date(trade_date: date, scan_time_ist: str = DEFAULT_SCA
                 "status": "OPEN",
                 "actual_result": "WAITING",
                 "outcome": "PENDING",
+
+                # extra helpful fields (for UI / comparison)
                 "trend": trend,
                 "reason": reason,
                 "scan_time_ist": scan_time_ist,
@@ -140,7 +162,8 @@ def generate_signals_for_date(trade_date: date, scan_time_ist: str = DEFAULT_SCA
     return signals
 
 
-def generate_signals():
+def generate_signals() -> list[dict]:
+    """Live mode: generate for today's IST date."""
     today = datetime.now(TZ_IST).date()
     return generate_signals_for_date(today, DEFAULT_SCAN_TIME_IST)
 
@@ -156,11 +179,15 @@ def evaluate_trade_actuals(
     entry_time_ist: datetime | None = None
 ):
     """
-    Uses 1m data (period-based fetch) then filters by date, evaluates after entry time.
+    Fetch 1-minute data and evaluate what happened AFTER entry time.
+
+    Outcome:
+    - WIN / LOSS / NOT_TRIGGERED
+    - If both SL and Target appear in same 1m candle, we mark LOSS (worst-case)
     """
     df = yf.download(
         ticker_ns,
-        period="7d",
+        period="7d",   # reliable; older days may not exist
         interval="1m",
         progress=False,
         auto_adjust=False
@@ -216,9 +243,10 @@ def evaluate_trade_actuals(
     return "PENDING", "Unknown side", post_high, post_low, last_close
 
 
-def check_results(history_df: pd.DataFrame):
+def check_results(history_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Live daily evaluation for today's OPEN trades in CSV.
+    Live daily evaluation:
+    Checks SL/Target for today's OPEN trades in trade_history.csv.
     """
     if history_df is None or history_df.empty:
         return history_df
@@ -241,8 +269,10 @@ def check_results(history_df: pd.DataFrame):
         entry_time_ist = None
         if "entry_time_ist" in history_df.columns and pd.notna(history_df.loc[idx, "entry_time_ist"]):
             try:
-                entry_time_ist = datetime.strptime(str(history_df.loc[idx, "entry_time_ist"]), "%Y-%m-%d %H:%M:%S%z")
-                entry_time_ist = entry_time_ist.astimezone(TZ_IST)
+                entry_time_ist = datetime.strptime(
+                    str(history_df.loc[idx, "entry_time_ist"]),
+                    "%Y-%m-%d %H:%M:%S%z"
+                ).astimezone(TZ_IST)
             except Exception:
                 entry_time_ist = None
 
