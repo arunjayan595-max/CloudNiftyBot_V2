@@ -46,51 +46,53 @@ def _parse_scan_dt_ist(trade_date: date, scan_time_ist: str) -> datetime:
     return TZ_IST.localize(datetime(trade_date.year, trade_date.month, trade_date.day, int(hh), int(mm), 0))
 
 
-def _extract_close_series(df: pd.DataFrame) -> pd.Series | None:
+def _get_1d_series(df: pd.DataFrame, col_name: str) -> pd.Series | None:
     """
-    Robustly extract a 1D Close Series from a yfinance DataFrame.
+    Robustly extract a 1D Series for a specific column name (e.g., 'Close').
+    Handles:
+    - MultiIndex columns (e.g., ('Close', 'RELIANCE.NS'))
+    - Duplicate columns
+    - DataFrames returned instead of Series
     """
     if df is None or df.empty:
         return None
 
-    # 1. Check for MultiIndex columns (common in yfinance > 0.2)
+    # Helper: if we find data, force it to 1D Series
+    def to_series(data):
+        if isinstance(data, pd.Series):
+            return data
+        if isinstance(data, pd.DataFrame):
+            if data.empty:
+                return None
+            # Take the first column
+            return data.iloc[:, 0]
+        return None
+
+    col_lower = col_name.lower()
+
+    # 1. Try standard column access
+    if col_name in df.columns:
+        return to_series(df[col_name])
+
+    # 2. Try MultiIndex "xs" cross-section
     if isinstance(df.columns, pd.MultiIndex):
-        # Try to find "Close" in the top level
         try:
-            # xs returns a DataFrame if drop_level=False, or if multiple columns match
-            # We use drop_level=True to try and get a simplified frame/series
-            close_data = df.xs("Close", axis=1, level=0, drop_level=True)
-            
-            # If result is DataFrame, take first column
-            if isinstance(close_data, pd.DataFrame):
-                return close_data.iloc[:, 0]
-            return close_data
+            # Look for level=0 being the column name (standard yfinance)
+            found = df.xs(col_name, axis=1, level=0, drop_level=True)
+            return to_series(found)
         except Exception:
             pass
-            
-        # Fallback: Check if any level contains "Close"
-        for col in df.columns:
-            # col is a tuple like ('Close', 'RELIANCE.NS')
-            if any(str(x).lower() == "close" for x in col):
-                data = df[col]
-                if isinstance(data, pd.DataFrame):
-                    return data.iloc[:, 0]
-                return data
-
-    # 2. Check for standard flat columns
-    if "Close" in df.columns:
-        data = df["Close"]
-        if isinstance(data, pd.DataFrame):
-            return data.iloc[:, 0]
-        return data
-
-    # 3. Case-insensitive fallback
+    
+    # 3. Brute-force search
+    # This handles cases where column names might be swapped or lowercase
     for c in df.columns:
-        if "close" in str(c).lower():
-            data = df[c]
-            if isinstance(data, pd.DataFrame):
-                return data.iloc[:, 0]
-            return data
+        # If c is a tuple (MultiIndex)
+        if isinstance(c, tuple):
+            if any(str(part).lower() == col_lower for part in c):
+                return to_series(df[c])
+        # If c is a string
+        elif str(c).lower() == col_lower:
+            return to_series(df[c])
 
     return None
 
@@ -103,23 +105,17 @@ def get_market_trend(as_of_date: date | None = None) -> str:
     # Download NIFTY data
     nifty = yf.download("^NSEI", period="36mo", interval="1d", progress=False)
     
-    # Extract Close column
-    close = _extract_close_series(nifty)
+    # Extract Close column robustly
+    close = _get_1d_series(nifty, "Close")
 
     # SAFETY CHECK: Ensure we have data
-    if close is None:
+    if close is None or close.empty:
         return "NEUTRAL"
-    
-    # SAFETY CHECK: If it is still a DataFrame (rare), force it to Series
-    if isinstance(close, pd.DataFrame):
-        if close.empty:
-            return "NEUTRAL"
-        close = close.iloc[:, 0]
 
     # Convert to numeric, coercing errors
     close = pd.to_numeric(close, errors="coerce")
     
-    # Drop NaNs
+    # Create temp frame for TA calc
     tmp = pd.DataFrame({"Close": close}).dropna(subset=["Close"])
     
     if tmp.empty:
@@ -176,34 +172,23 @@ def generate_signals_for_date(trade_date: date, scan_time_ist: str = DEFAULT_SCA
             if df_today.empty:
                 continue
 
-            # Handle MultiIndex for High/Low/Close extraction
-            # We create a temporary flat dataframe for easier logic
-            flat_df = pd.DataFrame(index=df_today.index)
-            
-            # Helper to safely grab columns
-            c_series = _extract_close_series(df_today)
-            if c_series is None: continue
-            flat_df["Close"] = c_series
+            # Extract OHLC robustly
+            c_series = _get_1d_series(df_today, "Close")
+            h_series = _get_1d_series(df_today, "High")
+            l_series = _get_1d_series(df_today, "Low")
 
-            # Extract High (similar logic to Close)
-            if "High" in df_today.columns:
-                h = df_today["High"]
-                flat_df["High"] = h.iloc[:, 0] if isinstance(h, pd.DataFrame) else h
-            elif isinstance(df_today.columns, pd.MultiIndex):
-                try: flat_df["High"] = df_today.xs("High", axis=1, level=0, drop_level=True)
-                except: flat_df["High"] = flat_df["Close"] # Fallback
-            
-            # Extract Low
-            if "Low" in df_today.columns:
-                l = df_today["Low"]
-                flat_df["Low"] = l.iloc[:, 0] if isinstance(l, pd.DataFrame) else l
-            elif isinstance(df_today.columns, pd.MultiIndex):
-                try: flat_df["Low"] = df_today.xs("Low", axis=1, level=0, drop_level=True)
-                except: flat_df["Low"] = flat_df["Close"] # Fallback
+            if c_series is None or h_series is None or l_series is None:
+                continue
 
-            # Ensure numeric
-            flat_df = flat_df.apply(pd.to_numeric, errors='coerce').dropna()
-            if flat_df.empty: continue
+            # Create a flat DataFrame for calculation
+            flat_df = pd.DataFrame({
+                "Close": c_series,
+                "High": h_series,
+                "Low": l_series
+            }).dropna()
+
+            if flat_df.empty: 
+                continue
 
             # ORB Logic
             first = flat_df.iloc[0]
@@ -294,21 +279,19 @@ def evaluate_trade_actuals(
         if df_day.empty:
             return "PENDING", "No 1m data for selected date", None, None, None
 
-        # Build clean 1m data
-        clean_df = pd.DataFrame(index=df_day.index)
-        
-        # High
-        if isinstance(df_day.columns, pd.MultiIndex):
-            try: clean_df["High"] = df_day.xs("High", axis=1, level=0, drop_level=True).iloc[:, 0]
-            except: clean_df["High"] = df_day.iloc[:, 0] # Fallback
-            try: clean_df["Low"] = df_day.xs("Low", axis=1, level=0, drop_level=True).iloc[:, 0]
-            except: clean_df["Low"] = df_day.iloc[:, 0]
-            try: clean_df["Close"] = df_day.xs("Close", axis=1, level=0, drop_level=True).iloc[:, 0]
-            except: clean_df["Close"] = df_day.iloc[:, 0]
-        else:
-            clean_df["High"] = df_day["High"]
-            clean_df["Low"] = df_day["Low"]
-            clean_df["Close"] = df_day["Close"]
+        # Robust Extraction
+        c_series = _get_1d_series(df_day, "Close")
+        h_series = _get_1d_series(df_day, "High")
+        l_series = _get_1d_series(df_day, "Low")
+
+        if c_series is None or h_series is None or l_series is None:
+            return "PENDING", "Data extraction failed", None, None, None
+
+        clean_df = pd.DataFrame({
+            "Close": c_series,
+            "High": h_series,
+            "Low": l_series
+        })
 
         # Handle time
         if entry_time_ist is None:
