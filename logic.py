@@ -31,20 +31,33 @@ def _parse_scan_dt_ist(trade_date: date, scan_time_ist: str) -> datetime:
 
 # ---------------- MARKET TREND ----------------
 def get_market_trend(as_of_date: date | None = None) -> str:
-    nifty = yf.download("^NSEI", period="12mo", interval="1d", progress=False)
+    """
+    Check NIFTY trend using 200 EMA.
+    Safe against insufficient history / NaNs.
+    """
+    nifty = yf.download("^NSEI", period="24mo", interval="1d", progress=False)
     if nifty is None or nifty.empty:
         return "NEUTRAL"
 
     nifty = nifty.dropna()
+
+    # Compute EMA_200
     nifty["EMA_200"] = ta.ema(nifty["Close"], length=200)
 
+    # If a date is provided, keep data up to that date
     if as_of_date is not None:
         nifty = nifty[nifty.index.date <= as_of_date]
         if nifty.empty:
             return "NEUTRAL"
 
+    # Drop rows where EMA is NaN (not enough history)
+    nifty = nifty.dropna(subset=["EMA_200"])
+    if nifty.empty:
+        return "NEUTRAL"
+
     last_close = float(nifty["Close"].iloc[-1])
     last_ema = float(nifty["EMA_200"].iloc[-1])
+
     return "BULLISH" if last_close > last_ema else "BEARISH"
 
 
